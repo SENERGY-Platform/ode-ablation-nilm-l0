@@ -18,6 +18,10 @@ derived from consecutive counter readings -- the meter publishes about every
 Look-ahead: the features of interval k include the two intervals after it
 (LEAD_INTERVALS). The operator therefore estimates interval k once interval
 k+2 has closed, i.e. 30 minutes late, and stamps the estimate with k's start.
+
+Look-back: up to one week (LOOKBACK_INTERVALS), so the model sees the site's
+weekly level and the same time a week earlier, which carry the slow heating
+demand that drives the compressor's duty cycle.
 """
 
 import numpy as np
@@ -26,6 +30,7 @@ import pandas as pd
 FACTOR = 50.0                 # transformer ratio of the main meter
 BUCKET = "15min"              # the resolution the operator estimates at
 LEAD_INTERVALS = 2            # how many later intervals an estimate waits for
+LOOKBACK_INTERVALS = 672      # the longest look-back of any feature: one week
 MAX_GAP_H = 2.0               # a counter difference across a longer gap is not a mean power
 MAX_READING_GAP_H = 5.0 / 60  # consecutive readings further apart give no short-interval power
 STEP_W = 1000.0               # a change between consecutive powers larger than this is a step
@@ -40,6 +45,7 @@ FEATURES = [
     "p_d1", "p_d1_lag1",
     "p_mean4", "p_mean16", "p_mean96", "p_min96", "p_max96", "p_std4",
     "p_above_min96", "p_above_q10_96",
+    "p_mean672", "p_lag672", "p_mean96_lag96",
     "p_lead1", "p_lead2", "pw_steps_lead1", "pw_range_lead1",
     "hour", "weekday", "doy_sin", "doy_cos",
 ]
@@ -139,7 +145,7 @@ def bucket_aggregates(main):
 
 
 def make_features(agg):
-    """Features per bucket: that bucket, earlier ones, and LEAD_INTERVALS later ones."""
+    """Features per bucket: that bucket, up to a week before it, and LEAD_INTERVALS after it."""
     if agg is None or agg.empty:
         return pd.DataFrame(columns=FEATURES)
     idx = pd.date_range(agg.index.min(), agg.index.max(), freq=BUCKET)
@@ -164,6 +170,10 @@ def make_features(agg):
     f["p_std4"] = p.rolling(4, min_periods=2).std()
     f["p_above_min96"] = p - f["p_min96"]
     f["p_above_q10_96"] = p - p.rolling(96, min_periods=1).quantile(0.1)
+
+    f["p_mean672"] = p.rolling(LOOKBACK_INTERVALS, min_periods=1).mean()
+    f["p_lag672"] = p.shift(LOOKBACK_INTERVALS)
+    f["p_mean96_lag96"] = f["p_mean96"].shift(96)
 
     f["p_lead1"] = p.shift(-1)
     f["p_lead2"] = p.shift(-2)

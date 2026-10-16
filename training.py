@@ -15,6 +15,12 @@ booster starts from the target's median, which is exactly 0 for a compressor
 that is off much of the time, and its leaf medians stay at 0 -- it never leaves
 the all-zero prediction (checked on synthetic on/off data before the first run).
 
+Heating-season weighting: intervals in HEATING_MONTHS count HEATING_WEIGHT times
+as much in the fit. A heat pump's compressor works differently in summer, when
+it mostly heats water, than in winter, when it heats the building; the operator
+is evaluated in February, and a year of history otherwise splits the model's
+capacity evenly across both regimes.
+
 The last VALIDATION before the training end is held out once for a validation
 MAE that is logged on the run; the model returned is then refitted on all of it.
 """
@@ -32,13 +38,16 @@ import operator_lib.util as util
 from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 from operator_lib.util.logger import logger as lib_logger
 
-from features import FEATURES, bucket_aggregates, bucket_target, make_features
+from features import FEATURES, LOCAL_TZ, bucket_aggregates, bucket_target, make_features
 
 
 # The main meter starts 2025-01-16; this reaches back to it. All topics are
 # device series read from timescale, so the 365-day Kafka bound does not apply.
 TRAINING_WINDOW = datetime.timedelta(days=382)
 VALIDATION = datetime.timedelta(days=28)
+
+HEATING_MONTHS = (10, 11, 12, 1, 2, 3, 4)
+HEATING_WEIGHT = 3.0
 
 HGB_PARAMS = dict(
     loss="squared_error",
@@ -99,6 +108,11 @@ def _pick(frames, column) -> typing.Optional[pd.DataFrame]:
     return None
 
 
+def _weights(index: pd.DatetimeIndex) -> np.ndarray:
+    months = index.tz_convert(LOCAL_TZ).month
+    return np.where(np.isin(months, HEATING_MONTHS), HEATING_WEIGHT, 1.0)
+
+
 def build_dataset(main, target) -> pd.DataFrame:
     feats = make_features(bucket_aggregates(main))
     y = bucket_target(target)
@@ -149,7 +163,8 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     with logger.trace("validate"):
         if len(fit_part) > 500 and len(val_part) > 50:
             est = HistGradientBoostingRegressor(**HGB_PARAMS)
-            est.fit(fit_part[FEATURES].astype(float), fit_part["target"])
+            est.fit(fit_part[FEATURES].astype(float), fit_part["target"],
+                    sample_weight=_weights(fit_part.index))
             pred = np.clip(est.predict(val_part[FEATURES].astype(float)), 0.0, None)
             y = val_part["target"].to_numpy()
             metrics["val_mae"] = float(np.mean(np.abs(pred - y)))
@@ -158,11 +173,13 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
 
     with logger.trace("fit"):
         est = HistGradientBoostingRegressor(**HGB_PARAMS)
-        est.fit(data[FEATURES].astype(float), data["target"])
+        est.fit(data[FEATURES].astype(float), data["target"],
+                sample_weight=_weights(data.index))
 
     logger.log_params({
         "training_window_days": TRAINING_WINDOW.days,
         "validation_days": VALIDATION.days,
+        "heating_weight": HEATING_WEIGHT,
         **{f"hgb_{k}": v for k, v in HGB_PARAMS.items()},
     })
     logger.log_metrics(metrics)

@@ -21,13 +21,14 @@ from operator_lib.util.helpers import TrainMlflowLogger
 from operator_lib.util.helpers.data import provide_historic_data_local
 from operator_lib.util.logger import logger
 
-from features import BUCKET, LEAD_INTERVALS, bucket_aggregates, make_features
+from features import BUCKET, LEAD_INTERVALS, LOOKBACK_INTERVALS, bucket_aggregates, make_features
 from training import train_model
 
-# Raw history kept for the features: the longest look-back is 96 intervals,
-# measured from the estimated interval, which trails the closed one.
-BUFFER = pd.Timedelta(hours=26)
-SEED_WINDOW = datetime.timedelta(hours=27)
+# Raw history kept for the features: the longest look-back (LOOKBACK_INTERVALS,
+# one week) measured from the estimated interval, plus margin for the counter
+# difference that opens the oldest interval.
+BUFFER = pd.Timedelta(BUCKET) * LOOKBACK_INTERVALS + pd.Timedelta(hours=2)
+SEED_WINDOW = (BUFFER + pd.Timedelta(hours=1)).to_pytimedelta()
 LEAD = pd.Timedelta(BUCKET) * LEAD_INTERVALS
 
 
@@ -69,8 +70,8 @@ class Operator(MLOperator):
         super().init(*args, **kwargs)
 
     def _seed(self, now: pd.Timestamp):
-        """Fill the buffer with the last day of main-meter history, so the first
-        intervals after a start have their look-back features."""
+        """Fill the buffer with the last week of main-meter history, so the
+        first intervals after a start have their look-back features."""
         self._seeded = True
         try:
             datasets = provide_historic_data_local(SEED_WINDOW)
