@@ -2,11 +2,11 @@
 from the site's main meter alone.
 
 infer() buffers raw main-meter readings. When a message arrives in a new
-15-minute interval, the interval that just closed is aggregated with
-features.py, the model predicts its mean compressor power, and every message of
-the following interval returns that estimate stamped with the closed interval's
-start. The estimate therefore always describes an interval whose main-meter data
-is complete, and its timestamp says which one.
+15-minute interval, the interval LEAD_INTERVALS before the one that just closed
+is estimated: its features include the intervals after it (see features.py),
+and those are now complete. Every message of the following interval returns
+that estimate stamped with the estimated interval's start, so each result
+arrives 30 minutes after its interval ends and says which interval it is about.
 """
 
 import datetime
@@ -21,12 +21,14 @@ from operator_lib.util.helpers import TrainMlflowLogger
 from operator_lib.util.helpers.data import provide_historic_data_local
 from operator_lib.util.logger import logger
 
-from features import BUCKET, bucket_aggregates, make_features
+from features import BUCKET, LEAD_INTERVALS, bucket_aggregates, make_features
 from training import train_model
 
-# Raw history kept for the features: the longest look-back is 96 intervals.
+# Raw history kept for the features: the longest look-back is 96 intervals,
+# measured from the estimated interval, which trails the closed one.
 BUFFER = pd.Timedelta(hours=26)
-SEED_WINDOW = datetime.timedelta(hours=26)
+SEED_WINDOW = datetime.timedelta(hours=27)
+LEAD = pd.Timedelta(BUCKET) * LEAD_INTERVALS
 
 
 class CustomConfig(Config):
@@ -97,21 +99,23 @@ class Operator(MLOperator):
         if latest is not None:
             self._current_bucket = latest.floor(BUCKET)
 
-    def _finalize(self, model: PyFuncModel, bucket: pd.Timestamp):
+    def _finalize(self, model: PyFuncModel, closed: pd.Timestamp):
+        """Estimate the interval LEAD_INTERVALS before the one that just closed."""
         self._last_bucket, self._last_pred = None, None
-        cutoff = bucket - BUFFER
+        target = closed - LEAD
+        cutoff = target - BUFFER
         self._main = [r for r in self._main if r[0] >= cutoff]
         if not self._main:
             return
         main = pd.DataFrame(self._main, columns=["time", "energy", "power"])
         feats = make_features(bucket_aggregates(main))
-        if bucket not in feats.index:
+        if target not in feats.index:
             return
-        row = feats.loc[[bucket]]
+        row = feats.loc[[target]]
         if pd.isna(row["p"].iloc[0]):
             return
         pred = float(np.asarray(model.predict(row)).ravel()[0])
-        self._last_bucket, self._last_pred = bucket, pred
+        self._last_bucket, self._last_pred = target, pred
 
     def infer(
         self,
@@ -136,7 +140,7 @@ class Operator(MLOperator):
             try:
                 self._finalize(model, self._current_bucket)
             except Exception as ex:
-                logger.warning(f"could not estimate interval {self._current_bucket}: {ex}")
+                logger.warning(f"could not estimate the interval before {self._current_bucket}: {ex}")
                 self._last_bucket, self._last_pred = None, None
             self._current_bucket = bucket
 

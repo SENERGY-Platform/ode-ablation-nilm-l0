@@ -14,6 +14,10 @@ OBIS 16.7 turned out to be empty for this meter (run umqy2ngstnlnuedubwlz52uy54
 logged coverage_pw_mean = 0). The within-interval statistics are therefore also
 derived from consecutive counter readings -- the meter publishes about every
 30 seconds -- and used wherever a measured power is absent.
+
+Look-ahead: the features of interval k include the two intervals after it
+(LEAD_INTERVALS). The operator therefore estimates interval k once interval
+k+2 has closed, i.e. 30 minutes late, and stamps the estimate with k's start.
 """
 
 import numpy as np
@@ -21,6 +25,7 @@ import pandas as pd
 
 FACTOR = 50.0                 # transformer ratio of the main meter
 BUCKET = "15min"              # the resolution the operator estimates at
+LEAD_INTERVALS = 2            # how many later intervals an estimate waits for
 MAX_GAP_H = 2.0               # a counter difference across a longer gap is not a mean power
 MAX_READING_GAP_H = 5.0 / 60  # consecutive readings further apart give no short-interval power
 STEP_W = 1000.0               # a change between consecutive powers larger than this is a step
@@ -35,6 +40,7 @@ FEATURES = [
     "p_d1", "p_d1_lag1",
     "p_mean4", "p_mean16", "p_mean96", "p_min96", "p_max96", "p_std4",
     "p_above_min96", "p_above_q10_96",
+    "p_lead1", "p_lead2", "pw_steps_lead1", "pw_range_lead1",
     "hour", "weekday", "doy_sin", "doy_cos",
 ]
 
@@ -133,7 +139,7 @@ def bucket_aggregates(main):
 
 
 def make_features(agg):
-    """Features per bucket, using only that bucket and earlier ones."""
+    """Features per bucket: that bucket, earlier ones, and LEAD_INTERVALS later ones."""
     if agg is None or agg.empty:
         return pd.DataFrame(columns=FEATURES)
     idx = pd.date_range(agg.index.min(), agg.index.max(), freq=BUCKET)
@@ -158,6 +164,11 @@ def make_features(agg):
     f["p_std4"] = p.rolling(4, min_periods=2).std()
     f["p_above_min96"] = p - f["p_min96"]
     f["p_above_q10_96"] = p - p.rolling(96, min_periods=1).quantile(0.1)
+
+    f["p_lead1"] = p.shift(-1)
+    f["p_lead2"] = p.shift(-2)
+    f["pw_steps_lead1"] = f["pw_steps"].shift(-1)
+    f["pw_range_lead1"] = f["pw_range"].shift(-1)
 
     local = idx.tz_convert(LOCAL_TZ)
     f["hour"] = local.hour + local.minute / 60.0
