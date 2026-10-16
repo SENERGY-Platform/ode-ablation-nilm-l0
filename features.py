@@ -5,10 +5,13 @@ calls exactly these functions when a 15-minute interval closes, so a feature can
 never mean one thing in training and another in inference.
 
 The only input is the main meter, as a raw frame with a `time` column:
-  energy  OBIS 1.8.0 import counter, raw kWh
+  energy  import counter, raw kWh (OBIS 1.8.0; the launch decides which variant)
   power   OBIS 16.7 instantaneous power, raw W
 
 The main meter is transformer-rated: every raw reading is multiplied by FACTOR.
+Whether the obis_1_8_0_f variant is already multiplied is not declared; the
+model is insensitive to a constant scale, and MAX_SITE_W is set high enough
+that a doubly multiplied value is kept rather than discarded as a glitch.
 
 OBIS 16.7 turned out to be empty for this meter (run umqy2ngstnlnuedubwlz52uy54
 logged coverage_pw_mean = 0). The within-interval statistics are therefore also
@@ -34,7 +37,7 @@ LOOKBACK_INTERVALS = 672      # the longest look-back of any feature: one week
 MAX_GAP_H = 2.0               # a counter difference across a longer gap is not a mean power
 MAX_READING_GAP_H = 5.0 / 60  # consecutive readings further apart give no short-interval power
 STEP_W = 1000.0               # a change between consecutive powers larger than this is a step
-MAX_SITE_W = 5e6              # anything above this is a counter glitch, not load
+MAX_SITE_W = 5e8              # above this is a counter glitch; high enough for a double factor
 LOCAL_TZ = "Europe/Berlin"
 
 AGG_COLUMNS = ["p_counter", "pw_mean", "pw_min", "pw_max", "pw_std", "pw_n", "pw_steps"]
