@@ -1,78 +1,134 @@
 """Training, on Ray.
 
-Separate from op.py because the two run in different places: op.py runs in the
-operator's own process for every message, while this runs distributed and rarely.
+Reads the main meter and the heating-circuit counter (input topics) and the
+compressor sub-meter (training topic, the label), builds 15-minute features
+with features.py, and fits a gradient-boosted regressor.
 
-provide_historic_data() is Operator Lib's reader over the platform's timeseries
-store. It returns Ray Datasets, so the training below never holds the whole
-history in one process.
+Squared-error loss, although the criterion is MAE: with absolute-error loss the
+booster starts from the target's median, which is exactly 0 for a compressor
+that is off much of the time, and its leaf medians stay at 0 -- it never leaves
+the all-zero prediction (checked on synthetic on/off data before the first run).
+
+The last VALIDATION before the training end is held out once for a validation
+MAE that is logged on the run; the model returned is then refitted on all of it.
 """
 
 import datetime
 import typing
 
+import numpy as np
+import pandas as pd
 import ray
 from mlflow.pyfunc import PythonModel
+from sklearn.ensemble import HistGradientBoostingRegressor
 
 from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
 
-
-# How much history one training pass reads.
-TRAINING_WINDOW = datetime.timedelta(days=90)
+from features import FEATURES, bucket_aggregates, bucket_target, make_features
 
 
-class OdeAblationNilmL0Model(PythonModel):
-    """The model MLflow registers and op.py later loads.
+# The main meter starts 2025-01-16; this reaches back to it. All topics are
+# device series read from timescale, so the 365-day Kafka bound does not apply.
+TRAINING_WINDOW = datetime.timedelta(days=382)
+VALIDATION = datetime.timedelta(days=28)
 
-    predict() receives exactly the payload infer() builds, so the two are one
-    contract in two files. Keep it serialisable: MLflow stores this object.
-    """
+HGB_PARAMS = dict(
+    loss="squared_error",
+    learning_rate=0.05,
+    max_iter=600,
+    max_leaf_nodes=63,
+    min_samples_leaf=40,
+    l2_regularization=1.0,
+    random_state=0,
+)
 
-    def __init__(self, baseline: float) -> None:
-        self.baseline = baseline
+
+class CompressorPowerModel(PythonModel):
+    """Maps one row of features.FEATURES to the compressor's mean power in W."""
+
+    def __init__(self, estimator, features: typing.List[str]) -> None:
+        self.estimator = estimator
+        self.features = list(features)
 
     def predict(self, context, model_input=None, params=None):
-        # The pyfunc signature carries a context when MLflow calls it and not when the
-        # model is called directly, so the payload is taken from whichever argument
-        # holds it.
-        payload = model_input if model_input is not None else context
-        value = float(payload.get("value", 0.0))
-        return value - self.baseline
+        frame = model_input if model_input is not None else context
+        X = pd.DataFrame(frame)[self.features].astype(float)
+        return np.clip(self.estimator.predict(X), 0.0, None)
 
 
-@ray.remote
-def _fit(datasets: typing.List[typing.Any]) -> float:
-    """The distributed part. Replace the body; keep the shape.
+def _frames(refs) -> typing.List[pd.DataFrame]:
+    out = []
+    for ref in refs:
+        ds = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
+        out.append(ds.to_pandas())
+    return out
 
-    A Ray task rather than a plain function so that training scales with the
-    cluster rather than with the operator's pod.
-    """
-    total, count = 0.0, 0
-    for dataset in datasets:
-        for batch in dataset.iter_batches(batch_size=4096):
-            values = batch.get("value")
-            if values is None:
-                continue
-            for value in values:
-                if value is None:
-                    continue
-                total += float(value)
-                count += 1
-    return total / count if count else 0.0
+
+def _pick(frames, column) -> typing.Optional[pd.DataFrame]:
+    for frame in frames:
+        if column in frame.columns:
+            return frame
+    return None
+
+
+def build_dataset(main, cov, target) -> pd.DataFrame:
+    feats = make_features(bucket_aggregates(main, cov))
+    y = bucket_target(target)
+    data = feats.join(y, how="inner")
+    return data[data["target"].notna() & data["p"].notna()]
 
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
-    """Read the history, fit, and hand back a model for MLflow to register."""
     with logger.trace("read history"):
-        datasets = provide_historic_data(TRAINING_WINDOW)
-    if not datasets:
-        # Explicitly nothing rather than a model fitted on no data: returning None
-        # leaves the previously registered model in place.
-        return None
+        inputs = _frames(provide_historic_data(TRAINING_WINDOW))
+        labels = _frames(provide_historic_data(TRAINING_WINDOW, role="training"))
+
+    main = _pick(inputs, "energy")
+    cov = _pick(inputs, "cov_energy")
+    target = _pick(labels, "target")
+    if main is None or target is None:
+        raise ValueError(
+            f"missing history: main meter frame {'found' if main is not None else 'absent'}, "
+            f"target frame {'found' if target is not None else 'absent'}")
+
+    with logger.trace("features"):
+        data = build_dataset(main, cov, target)
+    if data.empty:
+        raise ValueError(
+            f"no 15-minute interval has both a main-meter power and a target: "
+            f"main rows {len(main)}, target rows {len(target)}, "
+            f"cov rows {0 if cov is None else len(cov)}")
+
+    cutoff = data.index.max() - VALIDATION
+    fit_part, val_part = data[data.index < cutoff], data[data.index >= cutoff]
+
+    metrics = {
+        "n_intervals": float(len(data)),
+        "n_fit": float(len(fit_part)),
+        "n_val": float(len(val_part)),
+        "coverage_p_counter": float(data["p_counter"].notna().mean()),
+        "coverage_pw_mean": float(data["pw_mean"].notna().mean()),
+        "coverage_hz_p": float(data["hz_p"].notna().mean()),
+    }
+
+    with logger.trace("validate"):
+        if len(fit_part) > 500 and len(val_part) > 50:
+            est = HistGradientBoostingRegressor(**HGB_PARAMS)
+            est.fit(fit_part[FEATURES].astype(float), fit_part["target"])
+            pred = np.clip(est.predict(val_part[FEATURES].astype(float)), 0.0, None)
+            y = val_part["target"].to_numpy()
+            metrics["val_mae"] = float(np.mean(np.abs(pred - y)))
+            metrics["val_mae_zero"] = float(np.mean(np.abs(y)))
+            metrics["val_mae_median"] = float(np.mean(np.abs(y - np.median(fit_part["target"]))))
 
     with logger.trace("fit"):
-        baseline = ray.get(_fit.remote(datasets))
+        est = HistGradientBoostingRegressor(**HGB_PARAMS)
+        est.fit(data[FEATURES].astype(float), data["target"])
 
-    logger.log_params({"training_window_days": TRAINING_WINDOW.days})
-    logger.log_metrics({"baseline": baseline})
-    return OdeAblationNilmL0Model(baseline=baseline)
+    logger.log_params({
+        "training_window_days": TRAINING_WINDOW.days,
+        "validation_days": VALIDATION.days,
+        **{f"hgb_{k}": v for k, v in HGB_PARAMS.items()},
+    })
+    logger.log_metrics(metrics)
+    return CompressorPowerModel(est, FEATURES)

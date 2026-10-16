@@ -1,54 +1,125 @@
-"""The operator: what it infers per message, and when it retrains.
+"""The operator: estimates the heat pump compressor's 15-minute mean power in W
+from the site's main meter (and the heat pump heating-circuit counter).
 
-MLOperator is the machine-learning half of Operator Lib. It loads the model
-registered under this pipeline and operator from MLflow, calls infer() for every
-message that matches a selector, and calls train() when there is no model yet or
-when need_retraining() says so. Training runs on Ray.
-
-Three methods are yours. Everything else — Kafka, the model registry, the
-lifecycle — belongs to the library.
+infer() buffers raw readings. When a message arrives in a new 15-minute
+interval, the interval that just closed is aggregated with features.py, the
+model predicts its mean compressor power, and every message of the following
+interval returns that estimate stamped with the closed interval's start. The
+estimate therefore always describes an interval whose main-meter data is
+complete, and its timestamp says which one.
 """
 
 import datetime
 import typing
 
+import numpy as np
+import pandas as pd
 from mlflow.pyfunc import PyFuncModel, PythonModel
 
 from operator_lib.util import Config, MLOperator, Selector
 from operator_lib.util.helpers import TrainMlflowLogger
+from operator_lib.util.helpers.data import provide_historic_data_local
+from operator_lib.util.logger import logger
 
+from features import BUCKET, bucket_aggregates, make_features
 from training import train_model
+
+# Raw history kept for the features: the longest look-back is 96 intervals.
+BUFFER = pd.Timedelta(hours=26)
+SEED_WINDOW = datetime.timedelta(hours=26)
 
 
 class CustomConfig(Config):
-    """Deployment configuration, typed.
-
-    The base Config already carries mlflow_url, ray_url and ts_conn. Anything
-    added here arrives from the operator's deployment config under the same name,
-    with this value as the default.
-    """
-
-    # Retrain at most this often, in seconds. A day, so a deployment does not
-    # spend its life training.
+    # Retrain at most this often, in seconds.
     retrain_after_s = 86400
+
+
+def _utc_ts(value) -> pd.Timestamp:
+    ts = pd.Timestamp(value)
+    return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
+
+
+def _num(value):
+    if value is None:
+        return np.nan
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return np.nan
 
 
 class Operator(MLOperator):
     configType = CustomConfig
 
-    # Which inputs this operator accepts. "args" are the mapping destinations the
-    # pipeline is configured with, and the name is what infer() receives as
-    # "selector", so one operator can treat several input shapes differently.
     selectors = [
-        Selector({"name": "value", "args": ["value"]}),
+        Selector({"name": "main", "args": ["energy", "power"]}),
+        Selector({"name": "cov", "args": ["cov_energy"]}),
     ]
 
     def init(self, *args, **kwargs):
         # State first: under a data split, super().init() trains and replays the
-        # test window before it returns, so anything set after it is missing
-        # during the replay and overwrites what train() just recorded.
+        # test window before it returns.
         self.trained_at: typing.Optional[datetime.datetime] = None
+        self._main: typing.List[tuple] = []
+        self._cov: typing.List[tuple] = []
+        self._current_bucket: typing.Optional[pd.Timestamp] = None
+        self._last_bucket: typing.Optional[pd.Timestamp] = None
+        self._last_pred: typing.Optional[float] = None
+        self._seeded = False
         super().init(*args, **kwargs)
+
+    def _seed(self, now: pd.Timestamp):
+        """Fill the buffer with the last day of input history, so the first
+        intervals after a start have their look-back features."""
+        self._seeded = True
+        try:
+            datasets = provide_historic_data_local(SEED_WINDOW)
+        except Exception as ex:  # a missing history must not stop inference
+            logger.warning(f"could not seed the feature buffer: {ex}")
+            return
+        latest = None
+        for ds in datasets:
+            try:
+                frame = ds.to_pandas()
+            except Exception as ex:
+                logger.warning(f"could not read a seed dataset: {ex}")
+                continue
+            if frame.empty or "time" not in frame.columns:
+                continue
+            times = pd.to_datetime(frame["time"], utc=True)
+            if "energy" in frame.columns or "power" in frame.columns:
+                e = frame["energy"] if "energy" in frame.columns else [np.nan] * len(frame)
+                p = frame["power"] if "power" in frame.columns else [np.nan] * len(frame)
+                for t, ev, pv in zip(times, e, p):
+                    if t < now:
+                        self._main.append((t, _num(ev), _num(pv)))
+                        latest = t if latest is None or t > latest else latest
+            elif "cov_energy" in frame.columns:
+                for t, cv in zip(times, frame["cov_energy"]):
+                    if t < now:
+                        self._cov.append((t, _num(cv)))
+        self._main.sort(key=lambda r: r[0])
+        self._cov.sort(key=lambda r: r[0])
+        if latest is not None:
+            self._current_bucket = latest.floor(BUCKET)
+
+    def _finalize(self, model: PyFuncModel, bucket: pd.Timestamp):
+        self._last_bucket, self._last_pred = None, None
+        cutoff = bucket - BUFFER
+        self._main = [r for r in self._main if r[0] >= cutoff]
+        self._cov = [r for r in self._cov if r[0] >= cutoff]
+        if not self._main:
+            return
+        main = pd.DataFrame(self._main, columns=["time", "energy", "power"])
+        cov = pd.DataFrame(self._cov, columns=["time", "cov_energy"])
+        feats = make_features(bucket_aggregates(main, cov))
+        if bucket not in feats.index:
+            return
+        row = feats.loc[[bucket]]
+        if pd.isna(row["p"].iloc[0]):
+            return
+        pred = float(np.asarray(model.predict(row)).ravel()[0])
+        self._last_bucket, self._last_pred = bucket, pred
 
     def infer(
         self,
@@ -60,39 +131,39 @@ class Operator(MLOperator):
     ) -> typing.Tuple[
         typing.Optional[datetime.datetime], typing.Optional[typing.Any], typing.Optional[PythonModel]
     ]:
-        """Called for every message. Returns (result timestamp, result, new model).
-
-        The result timestamp may be None, which means now; it is what lets a
-        forecast carry the time it is about rather than the time it was made. The
-        third element replaces the registered model and is almost always None —
-        return one only from an algorithm that genuinely updates per message.
-        """
-        value = data.get("value")
-        if value is None or model is None:
+        if model is None:
             return None, None, None
+        now = _utc_ts(timestamp)
+        if not self._seeded:
+            self._seed(now)
 
-        prediction = model.predict({"timestamp": timestamp, "value": float(value)})
-        return None, {"prediction": prediction}, None
+        bucket = now.floor(BUCKET)
+        if self._current_bucket is None:
+            self._current_bucket = bucket
+        elif bucket > self._current_bucket:
+            try:
+                self._finalize(model, self._current_bucket)
+            except Exception as ex:
+                logger.warning(f"could not estimate interval {self._current_bucket}: {ex}")
+                self._last_bucket, self._last_pred = None, None
+            self._current_bucket = bucket
+
+        if "energy" in data or "power" in data:
+            self._main.append((now, _num(data.get("energy")), _num(data.get("power"))))
+        if "cov_energy" in data:
+            self._cov.append((now, _num(data.get("cov_energy"))))
+
+        if self._last_bucket is None or self._last_pred is None:
+            return None, None, None
+        return self._last_bucket.to_pydatetime(), {"prediction": self._last_pred}, None
 
     def train(
         self, model: typing.Optional[PyFuncModel], logger: TrainMlflowLogger
     ) -> typing.Optional[PythonModel]:
-        """Called when there is no model, or when need_retraining() said so.
-
-        Runs inside a Ray session the library opened, with an MLflow run already
-        started — so params and metrics logged through "logger" land on the run
-        the resulting model is registered from.
-        """
         self.trained_at = datetime.datetime.now(datetime.timezone.utc)
         return train_model(logger)
 
     def need_retraining(self, model: typing.Optional[PyFuncModel]) -> bool:
-        """Called after every inference, so it has to be cheap.
-
-        Time-based to start with. A better policy watches the data — a drift in the
-        input distribution, or an error that stops falling — and that is a decision
-        to make with the profile in front of you rather than a default to inherit.
-        """
         if model is None:
             return True
         if self.trained_at is None:

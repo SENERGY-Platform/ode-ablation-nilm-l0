@@ -13,6 +13,12 @@ dependencies = [
   # stability promise, so this pin is what keeps a rebuild reproducible — and
   # moving it is a deliberate edit, not a side effect of building again.
   "operator-lib @ git+https://github.com/SENERGY-Platform/analytics-operator-lib-python.git@v1.9.0",
+  "numpy",
+  "pandas",
+  "scikit-learn",
+  # Local-time features convert to Europe/Berlin; tzdata makes that independent
+  # of whether the image carries a system zone database.
+  "tzdata",
 ]
 
 [tool.uv]
