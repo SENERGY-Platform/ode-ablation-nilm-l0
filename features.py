@@ -4,9 +4,9 @@ One code path for both sides on purpose: the operator buffers raw readings and
 calls exactly these functions when a 15-minute interval closes, so a feature can
 never mean one thing in training and another in inference.
 
-Inputs are raw frames with a `time` column:
-  main: energy (OBIS 1.8.0 import counter, raw kWh) and power (OBIS 16.7, raw W)
-  cov:  cov_energy (heat pump heating-circuit counter, kWh)
+The only input is the main meter, as a raw frame with a `time` column:
+  energy  OBIS 1.8.0 import counter, raw kWh
+  power   OBIS 16.7 instantaneous power, raw W
 
 The main meter is transformer-rated: every raw reading is multiplied by FACTOR.
 """
@@ -20,7 +20,7 @@ MAX_GAP_H = 2.0               # a counter difference across a longer gap is not 
 MAX_SITE_W = 5e6              # anything above this is a counter glitch, not load
 LOCAL_TZ = "Europe/Berlin"
 
-AGG_COLUMNS = ["p_counter", "pw_mean", "pw_min", "pw_max", "pw_std", "pw_n", "hz_p"]
+AGG_COLUMNS = ["p_counter", "pw_mean", "pw_min", "pw_max", "pw_std", "pw_n"]
 
 FEATURES = [
     "p", "p_counter", "pw_mean", "pw_min", "pw_max", "pw_std", "pw_range", "pw_n",
@@ -28,7 +28,6 @@ FEATURES = [
     "p_d1", "p_d1_lag1",
     "p_mean4", "p_mean16", "p_mean96", "p_min96", "p_max96", "p_std4",
     "p_above_min96", "p_above_q10_96",
-    "hz_p", "hz_lag1", "hz_lag2", "hz_mean4",
     "hour", "weekday", "doy_sin", "doy_cos",
 ]
 
@@ -67,8 +66,8 @@ def _counter_power(df, col, wh_per_unit):
     return p.mask(bad)
 
 
-def bucket_aggregates(main, cov=None):
-    """Per-bucket aggregates of the raw frames, indexed by UTC bucket start."""
+def bucket_aggregates(main):
+    """Per-bucket aggregates of the raw main-meter frame, indexed by UTC bucket start."""
     parts = []
     main = _clean(main, ["energy", "power"])
     pc = _counter_power(main, "energy", FACTOR * 1000.0)
@@ -82,12 +81,6 @@ def bucket_aggregates(main, cov=None):
         g = pw.groupby("bucket")["power"].agg(["mean", "min", "max", "std", "count"])
         g.columns = ["pw_mean", "pw_min", "pw_max", "pw_std", "pw_n"]
         parts.append(g)
-
-    if cov is not None and len(cov):
-        cov = _clean(cov, ["cov_energy"])
-        hz = _counter_power(cov, "cov_energy", 1000.0)
-        if len(hz):
-            parts.append(hz.rename("hz_p"))
 
     if not parts:
         return pd.DataFrame(columns=AGG_COLUMNS)
@@ -124,12 +117,6 @@ def make_features(agg):
     f["p_std4"] = p.rolling(4, min_periods=2).std()
     f["p_above_min96"] = p - f["p_min96"]
     f["p_above_q10_96"] = p - p.rolling(96, min_periods=1).quantile(0.1)
-
-    hz = a["hz_p"]
-    f["hz_p"] = hz
-    f["hz_lag1"] = hz.shift(1)
-    f["hz_lag2"] = hz.shift(2)
-    f["hz_mean4"] = hz.rolling(4, min_periods=1).mean()
 
     local = idx.tz_convert(LOCAL_TZ)
     f["hour"] = local.hour + local.minute / 60.0

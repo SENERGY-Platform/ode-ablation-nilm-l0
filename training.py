@@ -1,8 +1,10 @@
 """Training, on Ray.
 
-Reads the main meter and the heating-circuit counter (input topics) and the
-compressor sub-meter (training topic, the label), builds 15-minute features
-with features.py, and fits a gradient-boosted regressor.
+The main meter is the only input topic. The compressor sub-meter (the label) and
+the heat pump heating-circuit counter are training topics: read here, never
+delivered to infer(). The heating-circuit counter is not a feature -- a feature
+has to exist when the operator runs, and that meter will not -- so it is read
+but unused at present.
 
 Squared-error loss, although the criterion is MAE: with absolute-error loss the
 booster starts from the target's median, which is exactly 0 for a compressor
@@ -71,8 +73,8 @@ def _pick(frames, column) -> typing.Optional[pd.DataFrame]:
     return None
 
 
-def build_dataset(main, cov, target) -> pd.DataFrame:
-    feats = make_features(bucket_aggregates(main, cov))
+def build_dataset(main, target) -> pd.DataFrame:
+    feats = make_features(bucket_aggregates(main))
     y = bucket_target(target)
     data = feats.join(y, how="inner")
     return data[data["target"].notna() & data["p"].notna()]
@@ -84,7 +86,6 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         labels = _frames(provide_historic_data(TRAINING_WINDOW, role="training"))
 
     main = _pick(inputs, "energy")
-    cov = _pick(inputs, "cov_energy")
     target = _pick(labels, "target")
     if main is None or target is None:
         raise ValueError(
@@ -92,12 +93,11 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
             f"target frame {'found' if target is not None else 'absent'}")
 
     with logger.trace("features"):
-        data = build_dataset(main, cov, target)
+        data = build_dataset(main, target)
     if data.empty:
         raise ValueError(
             f"no 15-minute interval has both a main-meter power and a target: "
-            f"main rows {len(main)}, target rows {len(target)}, "
-            f"cov rows {0 if cov is None else len(cov)}")
+            f"main rows {len(main)}, target rows {len(target)}")
 
     cutoff = data.index.max() - VALIDATION
     fit_part, val_part = data[data.index < cutoff], data[data.index >= cutoff]
@@ -108,7 +108,6 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "n_val": float(len(val_part)),
         "coverage_p_counter": float(data["p_counter"].notna().mean()),
         "coverage_pw_mean": float(data["pw_mean"].notna().mean()),
-        "coverage_hz_p": float(data["hz_p"].notna().mean()),
     }
 
     with logger.trace("validate"):

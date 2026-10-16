@@ -6,9 +6,9 @@
 name: ode-ablation-nilm-l0
 description: >
   Estimates the heat pump compressor's 15-minute mean electrical power in W from
-  the site's transformer-rated main meter (factor 50) and the heat pump
-  heating-circuit energy counter. Each result describes the last completed
-  15-minute interval and carries that interval's start as its timestamp.
+  the site's transformer-rated main meter (factor 50) alone. Each result
+  describes the last completed 15-minute interval and carries that interval's
+  start as its timestamp.
 image: ghcr.io/senergy-platform/ode-ablation-nilm-l0:latest
 
 # Public makes the operator visible to other users of the platform. Registration
@@ -16,14 +16,12 @@ image: ghcr.io/senergy-platform/ode-ablation-nilm-l0:latest
 pub: false
 deploymentType: local
 
-# What the pipeline editor offers as inputs. Each selector in op.py takes one set:
-# energy + power from the main meter, cov_energy from the heating-circuit meter.
+# What the pipeline editor offers as inputs: both come from the main meter.
+# energy is OBIS 1.8.0 (raw import counter, kWh), power is OBIS 16.7 (raw W).
 inputs:
   - name: energy
     type: float
   - name: power
-    type: float
-  - name: cov_energy
     type: float
 
 # What the operator emits. These are the keys of the dictionary infer() returns.

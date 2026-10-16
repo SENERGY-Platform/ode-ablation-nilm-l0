@@ -1,12 +1,12 @@
 """The operator: estimates the heat pump compressor's 15-minute mean power in W
-from the site's main meter (and the heat pump heating-circuit counter).
+from the site's main meter alone.
 
-infer() buffers raw readings. When a message arrives in a new 15-minute
-interval, the interval that just closed is aggregated with features.py, the
-model predicts its mean compressor power, and every message of the following
-interval returns that estimate stamped with the closed interval's start. The
-estimate therefore always describes an interval whose main-meter data is
-complete, and its timestamp says which one.
+infer() buffers raw main-meter readings. When a message arrives in a new
+15-minute interval, the interval that just closed is aggregated with
+features.py, the model predicts its mean compressor power, and every message of
+the following interval returns that estimate stamped with the closed interval's
+start. The estimate therefore always describes an interval whose main-meter data
+is complete, and its timestamp says which one.
 """
 
 import datetime
@@ -53,7 +53,6 @@ class Operator(MLOperator):
 
     selectors = [
         Selector({"name": "main", "args": ["energy", "power"]}),
-        Selector({"name": "cov", "args": ["cov_energy"]}),
     ]
 
     def init(self, *args, **kwargs):
@@ -61,7 +60,6 @@ class Operator(MLOperator):
         # test window before it returns.
         self.trained_at: typing.Optional[datetime.datetime] = None
         self._main: typing.List[tuple] = []
-        self._cov: typing.List[tuple] = []
         self._current_bucket: typing.Optional[pd.Timestamp] = None
         self._last_bucket: typing.Optional[pd.Timestamp] = None
         self._last_pred: typing.Optional[float] = None
@@ -69,7 +67,7 @@ class Operator(MLOperator):
         super().init(*args, **kwargs)
 
     def _seed(self, now: pd.Timestamp):
-        """Fill the buffer with the last day of input history, so the first
+        """Fill the buffer with the last day of main-meter history, so the first
         intervals after a start have their look-back features."""
         self._seeded = True
         try:
@@ -86,20 +84,16 @@ class Operator(MLOperator):
                 continue
             if frame.empty or "time" not in frame.columns:
                 continue
+            if "energy" not in frame.columns and "power" not in frame.columns:
+                continue
             times = pd.to_datetime(frame["time"], utc=True)
-            if "energy" in frame.columns or "power" in frame.columns:
-                e = frame["energy"] if "energy" in frame.columns else [np.nan] * len(frame)
-                p = frame["power"] if "power" in frame.columns else [np.nan] * len(frame)
-                for t, ev, pv in zip(times, e, p):
-                    if t < now:
-                        self._main.append((t, _num(ev), _num(pv)))
-                        latest = t if latest is None or t > latest else latest
-            elif "cov_energy" in frame.columns:
-                for t, cv in zip(times, frame["cov_energy"]):
-                    if t < now:
-                        self._cov.append((t, _num(cv)))
+            e = frame["energy"] if "energy" in frame.columns else [np.nan] * len(frame)
+            p = frame["power"] if "power" in frame.columns else [np.nan] * len(frame)
+            for t, ev, pv in zip(times, e, p):
+                if t < now:
+                    self._main.append((t, _num(ev), _num(pv)))
+                    latest = t if latest is None or t > latest else latest
         self._main.sort(key=lambda r: r[0])
-        self._cov.sort(key=lambda r: r[0])
         if latest is not None:
             self._current_bucket = latest.floor(BUCKET)
 
@@ -107,12 +101,10 @@ class Operator(MLOperator):
         self._last_bucket, self._last_pred = None, None
         cutoff = bucket - BUFFER
         self._main = [r for r in self._main if r[0] >= cutoff]
-        self._cov = [r for r in self._cov if r[0] >= cutoff]
         if not self._main:
             return
         main = pd.DataFrame(self._main, columns=["time", "energy", "power"])
-        cov = pd.DataFrame(self._cov, columns=["time", "cov_energy"])
-        feats = make_features(bucket_aggregates(main, cov))
+        feats = make_features(bucket_aggregates(main))
         if bucket not in feats.index:
             return
         row = feats.loc[[bucket]]
@@ -148,10 +140,7 @@ class Operator(MLOperator):
                 self._last_bucket, self._last_pred = None, None
             self._current_bucket = bucket
 
-        if "energy" in data or "power" in data:
-            self._main.append((now, _num(data.get("energy")), _num(data.get("power"))))
-        if "cov_energy" in data:
-            self._cov.append((now, _num(data.get("cov_energy"))))
+        self._main.append((now, _num(data.get("energy")), _num(data.get("power"))))
 
         if self._last_bucket is None or self._last_pred is None:
             return None, None, None
