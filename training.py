@@ -6,6 +6,10 @@ delivered to infer(). The heating-circuit counter is not a feature -- a feature
 has to exist when the operator runs, and that meter will not -- so it is read
 but unused at present.
 
+Each topic's read is collected on its own. A topic whose read fails is logged as
+a metric read_failed_<role>_<dests> and skipped; only a missing main meter or a
+missing label stops training, and then the error names which topic failed.
+
 Squared-error loss, although the criterion is MAE: with absolute-error loss the
 booster starts from the target's median, which is exactly 0 for a compressor
 that is off much of the time, and its leaf medians stay at 0 -- it never leaves
@@ -24,7 +28,9 @@ import ray
 from mlflow.pyfunc import PythonModel
 from sklearn.ensemble import HistGradientBoostingRegressor
 
+import operator_lib.util as util
 from operator_lib.util.helpers import provide_historic_data, TrainMlflowLogger
+from operator_lib.util.logger import logger as lib_logger
 
 from features import FEATURES, bucket_aggregates, bucket_target, make_features
 
@@ -58,12 +64,32 @@ class CompressorPowerModel(PythonModel):
         return np.clip(self.estimator.predict(X), 0.0, None)
 
 
-def _frames(refs) -> typing.List[pd.DataFrame]:
-    out = []
-    for ref in refs:
-        ds = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
-        out.append(ds.to_pandas())
-    return out
+def _topic_labels(role: str) -> typing.List[str]:
+    """One label per topic of a role, in the order provide_historic_data
+    returns them: the role and the topic's mapping dests, as plain words."""
+    try:
+        dep_config = util.DeploymentConfig()
+        opr_config = util.OperatorConfig(util.load_operator_config_json(dep_config))
+        topics = opr_config.trainingTopics if role == "training" else opr_config.inputTopics
+        return [f"{role}_" + "_".join(m.dest for m in t.mappings) for t in topics]
+    except Exception:
+        return []
+
+
+def _frames(refs, role: str) -> typing.Tuple[typing.List[pd.DataFrame], typing.List[str]]:
+    """Collect each topic's read separately. Returns the frames that arrived and
+    the labels of the topics whose read failed."""
+    labels = _topic_labels(role)
+    frames, failed = [], []
+    for i, ref in enumerate(refs):
+        label = labels[i] if i < len(labels) else f"{role}_topic_{i}"
+        try:
+            ds = ray.get(ref) if isinstance(ref, ray.ObjectRef) else ref
+            frames.append(ds.to_pandas())
+        except Exception as ex:
+            lib_logger.error(f"history read failed for {label}: {type(ex).__name__}: {ex}")
+            failed.append(f"{label} ({type(ex).__name__})")
+    return frames, failed
 
 
 def _pick(frames, column) -> typing.Optional[pd.DataFrame]:
@@ -82,15 +108,24 @@ def build_dataset(main, target) -> pd.DataFrame:
 
 def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
     with logger.trace("read history"):
-        inputs = _frames(provide_historic_data(TRAINING_WINDOW))
-        labels = _frames(provide_historic_data(TRAINING_WINDOW, role="training"))
+        inputs, failed_inputs = _frames(provide_historic_data(TRAINING_WINDOW), "input")
+        labels, failed_labels = _frames(
+            provide_historic_data(TRAINING_WINDOW, role="training"), "training")
+
+    failed = failed_inputs + failed_labels
+    if failed:
+        logger.log_metrics({
+            "read_failed_" + f.split(" ")[0]: 1.0 for f in failed
+        })
 
     main = _pick(inputs, "energy")
     target = _pick(labels, "target")
     if main is None or target is None:
         raise ValueError(
-            f"missing history: main meter frame {'found' if main is not None else 'absent'}, "
-            f"target frame {'found' if target is not None else 'absent'}")
+            "required history missing: main meter "
+            f"{'read' if main is not None else 'NOT read'}, label "
+            f"{'read' if target is not None else 'NOT read'}; "
+            f"failed topics: {', '.join(failed) if failed else 'none (a topic returned no frame)'}")
 
     with logger.trace("features"):
         data = build_dataset(main, target)
@@ -108,6 +143,7 @@ def train_model(logger: TrainMlflowLogger) -> typing.Optional[PythonModel]:
         "n_val": float(len(val_part)),
         "coverage_p_counter": float(data["p_counter"].notna().mean()),
         "coverage_pw_mean": float(data["pw_mean"].notna().mean()),
+        "read_failed_topics": float(len(failed)),
     }
 
     with logger.trace("validate"):
